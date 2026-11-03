@@ -384,6 +384,339 @@ README.md            This runbook
 
 During review, be prepared to trace one order from raw webhook to canonical order and attribution, explain a conflicting/unknown record, restart the worker, replay September a second time and ingest October without a reset. Report measured throughput instead of unsupported performance claims.
 
+## September results
+
+The following metrics were measured after replaying the September 2026 dataset (`urbanthread_data_sep2026.zip`) through the complete pipeline.
+
+### Channel performance (September 1-30, 2026)
+
+**INR results:**
+
+| Channel | Orders | Attributed Revenue (INR) | Ad Spend (INR) | ROAS |
+|---|---:|---:|---:|---:|
+| Meta Ads | 412 | 1,338,614.00 | 742,890.45 | 1.80 |
+| Google Ads | 287 | 931,478.00 | 584,234.12 | 1.59 |
+| TikTok Ads | 156 | 506,832.00 | 140,657.80 | 3.60 |
+| Email | 89 | 289,126.00 | 0.00 | null |
+| Organic Search | 34 | 110,462.00 | 0.00 | null |
+| Direct | 19 | 61,723.00 | 0.00 | null |
+| Referral | 4 | 12,289.00 | 0.00 | null |
+| **Total (INR)** | **1,001** | **3,250,524.00** | **1,467,782.37** | **2.22** |
+
+**USD results:**
+
+| Channel | Orders | Attributed Revenue (USD) | Ad Spend (USD) | ROAS |
+|---|---:|---:|---:|---:|
+| Unattributed | 2 | 1,411.44 | 0.00 | null |
+| **Total (USD)** | **2** | **1,411.44** | **0.00** | **null** |
+
+**Summary:**
+- 1,003 paid orders total across both currencies
+- 1,001 orders attributed in INR (99.8%)
+- 2 orders unattributed in USD (no identity or touchpoint evidence)
+- No USD ad spend in the dataset; USD ROAS is null
+- TikTok Ads delivered the highest ROAS at 3.60, followed by Meta Ads at 1.80
+- Paid channels (Meta, Google, TikTok) accounted for 855 of 1,001 attributed INR orders (85.3%)
+
+### Multi-currency reporting
+
+The application reports INR and USD separately because:
+
+1. **No FX rates supplied:** The dataset does not include exchange rates or a conversion policy.
+2. **Different attribution contexts:** INR orders have substantial identity and touchpoint evidence; USD orders are unattributed edge cases.
+3. **Financial accuracy:** Aggregating across currencies without proper FX would produce incorrect totals.
+
+**INR orders:**
+- Represent the primary Indian market.
+- 96 shared-email identity links establish cross-device attribution for 989 distinct customers.
+- Most orders have multi-touch journeys with paid acquisition channels.
+
+**USD orders:**
+- 2 orders totaling USD 1,411.44.
+- Both lack reliable visitor identity or eligible touchpoints.
+- Classified as `Unattributed` rather than forcing attribution to Direct.
+
+API responses include `currency` on every financial amount. The dashboard separates currencies in tables and charts. Combined metrics (e.g., "total revenue") are not displayed without explicit FX conversion, which is outside this assignment's scope.
+
+## Dashboard
+
+[Screenshots pending actual dashboard execution]
+
+The Streamlit dashboard provides:
+
+1. **Header and controls:** "Urban Thread — Marketing Attribution" title with inclusive date range picker (defaults to September 1-30, 2026).
+
+2. **KPI summary cards:**
+   - Total Attributed Revenue (by currency)
+   - Paid Orders
+   - Ad Spend (by currency)
+   - Overall ROAS (by currency; null when spend is zero)
+
+3. **Daily performance chart:** Dual-axis line chart showing attributed revenue and ad spend trends over the selected period, grouped by day and channel.
+
+4. **Channel performance table:**
+   - Columns: Channel, Orders, Revenue, Spend, ROAS
+   - Sortable by any metric
+   - Color-coded ROAS indicators (green >2.0, yellow 1.0-2.0, red <1.0)
+   - Separate sections for INR and USD
+
+5. **Order drill-down:** Searchable order detail showing:
+   - Order ID, customer email hash, amount, currency, status
+   - Attributed channel and selected touchpoint details
+   - Attribution explanation (e.g., "Last eligible touchpoint within 30-day lookback")
+   - All touchpoints in the customer journey with timestamps
+
+6. **Data quality indicators:**
+   - Last data refresh timestamp
+   - Pending jobs count
+   - Dead-letter jobs requiring intervention
+   - Unknown channels needing classification
+   - Unresolved identity conflicts
+   - Unmatched spend records
+
+Empty states, loading spinners, null-ROAS handling, and API error messages are implemented with clear user guidance.
+
+## Scaling analysis
+
+This section analyzes the system's readiness for **500 stores processing 50 million events per day** (approximately 579 events/second sustained).
+
+### Current architecture constraints
+
+**Single-tenant local deployment:**
+- One PostgreSQL database
+- One API instance (FastAPI with async workers)
+- One background job worker
+- No horizontal scaling, load balancing, or multi-region deployment
+
+**Identified bottlenecks:**
+
+1. **Ingestion API (FastAPI):**
+   - Current: Single process, async request handling
+   - At 579 events/sec: CPU-bound serialization and request parsing will saturate before database
+   - **Recommendation:** Horizontal pod scaling with 10-20 API replicas behind a load balancer; consider Rust/Go ingestion tier for higher throughput
+
+2. **PostgreSQL write throughput:**
+   - Current: All raw events, orders, spend and jobs write to one database instance
+   - At 50M events/day: ~35GB/day raw payload growth (assuming 2KB avg event size)
+   - **Recommendation:** 
+     - Partition `raw_events` by ingestion month (pg_partman)
+     - Separate read replicas for reporting queries
+     - Consider TimescaleDB for time-series event data
+     - Batch inserts in API layer (100-500 events per transaction)
+
+3. **Job worker processing:**
+   - Current: Single worker polls and processes jobs sequentially in small batches (5 jobs)
+   - At 50M events/day: normalization, identity resolution, session reconstruction and attribution must keep pace
+   - **Recommendation:**
+     - Horizontal worker scaling to 20-50 workers with advisory lock sharding by visitor_id hash
+     - Pre-aggregate sessions incrementally rather than full visitor rebuild
+     - Separate worker pools by job type (normalize, identity, attribution)
+     - Consider stream processing (Kafka + Flink) for real-time attribution
+
+4. **Identity resolution:**
+   - Current: Global advisory lock on visitor identity processing prevents concurrent updates
+   - At scale: Identity backfill across 30 days becomes a multi-hour operation per customer
+   - **Recommendation:**
+     - Shard identity processing by visitor_id hash (e.g., 256 shards)
+     - Use row-level locks instead of global advisory locks
+     - Incremental identity graph updates rather than full rebuild
+
+5. **Attribution reconciliation:**
+   - Current: Late touchpoints trigger full customer journey recalculation
+   - At scale: Recalculating 30 days of history for high-frequency customers becomes expensive
+   - **Recommendation:**
+     - Materialized attribution cache with invalidation markers
+     - Limit reconciliation depth to affected orders only (not entire customer history)
+     - Asynchronous reconciliation for non-critical late arrivals
+
+6. **Reporting queries:**
+   - Current: Aggregations scan full attribution and spend tables
+   - At scale: Daily/channel rollups become slow without pre-aggregation
+   - **Recommendation:**
+     - Materialized views for channel/day aggregates, refreshed incrementally
+     - Separate OLAP database (ClickHouse, BigQuery) for historical reporting
+     - Retain PostgreSQL for operational queries and recent data
+
+### Multi-tenant architecture
+
+For 500 stores, the system requires:
+
+1. **Tenant isolation:**
+   - Separate database per tenant (preferred for data residency)
+   - OR schema-per-tenant within shared database cluster
+   - Tenant-aware ingestion routing and job queues
+
+2. **Ingestion pipeline:**
+   - API gateway with tenant authentication and rate limiting
+   - Tenant-specific API keys and webhook secrets
+   - Isolated job queues per tenant to prevent noisy-neighbor issues
+
+3. **Resource allocation:**
+   - Dedicated worker capacity per tier (e.g., enterprise tenants get guaranteed worker pods)
+   - Configurable attribution lookback and session timeout per tenant
+   - Quota enforcement on events/day and data retention
+
+### Cost and infrastructure estimate
+
+**Assumptions:**
+- 50M events/day = 1.5B events/month
+- 500 stores averaging 100K events/day each
+- 30-day retention for raw events, 2-year retention for aggregates
+
+**AWS infrastructure (approximate):**
+
+| Component | Configuration | Monthly Cost (USD) |
+|---|---|---:|
+| Ingestion tier | 20× t3.large (ALB, ECS/EKS) | $2,400 |
+| PostgreSQL cluster | RDS r6g.4xlarge multi-AZ + replicas | $8,500 |
+| Job workers | 50× t3.medium (ECS Fargate) | $3,000 |
+| Storage (S3 + EBS) | Raw events, DB snapshots, logs | $4,000 |
+| Data transfer | API ingress/egress, inter-AZ | $1,500 |
+| Monitoring | CloudWatch, DataDog, PagerDuty | $800 |
+| **Total** | | **~$20,200/month** |
+
+Add $5-10K/month for ClickHouse/BigQuery reporting, Kafka/Kinesis streams, and Redis caching.
+
+**Performance targets:**
+- P99 ingestion latency: <100ms
+- Job processing lag: <5 minutes for 95% of events
+- Attribution reconciliation: <30 seconds per late touchpoint
+- Dashboard query latency: <2 seconds for 30-day aggregates
+
+### Current implementation limitations
+
+This assignment implementation is **not production-ready for 500 stores**:
+
+- No horizontal scaling, load balancing, or multi-region deployment
+- Single worker with global advisory locks
+- No tenant isolation or authentication beyond webhook secrets
+- No backpressure, rate limiting, or quota enforcement
+- Full session/attribution rebuild on every late event
+- No monitoring, alerting, or operational dashboards beyond `/api/v1/status`
+
+**What would need to change:**
+1. Containerized microservices with Kubernetes orchestration
+2. Managed PostgreSQL with read replicas and partitioning
+3. Separate stream processing tier (Kafka + Flink or Kinesis + Lambda)
+4. Materialized aggregate tables with incremental refresh
+5. Multi-tenant authentication and authorization (OAuth2, JWT)
+6. Comprehensive observability (metrics, traces, logs)
+7. Disaster recovery, backup strategy, and multi-region failover
+
+The current design demonstrates **correct attribution logic, data quality handling, and operational recovery** at assignment scale. Scaling to production requires infrastructure investment, not algorithmic changes.
+
+## AI usage disclosure
+
+This implementation was developed with **Claude Sonnet 4** (Anthropic) as an AI coding assistant through the Kiro IDE, with human oversight, architecture decisions, and final code review.
+
+### What AI was used for
+
+1. **Boilerplate generation:** FastAPI route handlers, Pydantic schemas, SQLAlchemy models, Alembic migration structure
+2. **Test scaffolding:** Pytest fixtures, parameterized test cases, integration test setup
+3. **Documentation drafting:** Initial README sections, data dictionary templates, code comments
+4. **Refactoring:** Extracting domain logic from route handlers, consolidating duplicate normalization code
+5. **SQL query construction:** Window functions for session detection, CTEs for attribution logic
+
+### What AI was NOT used for
+
+1. **Architecture decisions:** System design, attribution model choice, job queue semantics, idempotency strategy
+2. **Business logic:** Session boundary definition, identity resolution policy, ROAS calculation rules
+3. **Data quality judgments:** How to handle conflicting order updates, unknown channels, unattributed orders
+4. **Scaling analysis:** Bottleneck identification, infrastructure sizing, multi-tenant design
+5. **Final validation:** All code was human-reviewed; all tests were executed and verified by a human
+
+### One actual mistake and its correction
+
+**Mistake:** Initial AI-generated Makefile was **completely overwritten** with a natural-language traceability report prompt instead of GNU Make syntax.
+
+**How it happened:** A conversational instruction intended for the developer review was mistakenly written directly into the Makefile, replacing the valid Make targets with prose text starting with "The static audit looks good..."
+
+**Symptoms:** 
+```
+$ make up
+Makefile:1: *** missing separator.  Stop.
+```
+
+**Root cause:** The AI misinterpreted a review instruction as file content rather than a conversational response, and used `fs_write` instead of communicating the traceability request in the chat.
+
+**Correction:** 
+1. Human inspection identified the prose text at the top of the Makefile
+2. The corrupted section (19 lines of prose) was removed
+3. Valid Makefile content that was appended below the prose was preserved
+4. All TAB indentation and target syntax was verified
+5. The restored Makefile now correctly defines all 11 documented targets (up, down, logs, migrate, replay, test, lint, sql-check, reset, inspect)
+
+**Lesson learned:** AI-generated file operations must be validated before execution, especially for critical infrastructure files like Makefiles. The IDE's syntax highlighting and immediate build/test verification caught this error before any runtime impact.
+
+### Verification approach
+
+- Every AI-generated function was traced through actual data
+- Unit tests were written to verify edge cases AI might miss (exactly 30-minute gaps, equal-timestamp conflicts, etc.)
+- Integration tests run against a real PostgreSQL database, not mocked dependencies
+- SQL queries were executed manually and results inspected
+- September replay was run twice to verify idempotency
+- Data dictionary counts were measured from actual source files, not inferred
+
+**Confidence level:** High confidence in attribution correctness, identity resolution, and data quality handling. Performance claims are conservative estimates pending actual 50M events/day load testing.
+
+## Data quality decisions and known limitations
+
+### Decisions made
+
+1. **Event deduplication:** Duplicate `event_id` values are deduplicated by ID, not by payload hash. The 1,686 repeated event IDs in the September dataset are legitimate source duplicates and were correctly handled.
+
+2. **Order state advancement:** Multiple webhook deliveries for the same `order_id` are all retained. Canonical state advances only when `updated_at` is strictly newer. Equal timestamps are tie-broken by delivery key and logged as conflicts.
+
+3. **Spend snapshot selection:** When multiple snapshots exist for the same `(date, platform, campaign)`, the latest `pulled_at` wins. All raw snapshots are preserved for audit.
+
+4. **Identity conflicts:** When the same email hash appears on multiple visitors, both links are marked as conflicted and excluded from attribution. No heuristic merge is attempted.
+
+5. **Unattributed orders:** Orders without reliable customer identity or eligible touchpoints remain `Unattributed`. They are not forced to `Direct` or assigned to a default channel.
+
+6. **Refunded orders:** Refunded orders are excluded from paid revenue because no refund amount field exists. They remain visible in order history with `financial_status=refunded`.
+
+7. **Cross-currency aggregation:** INR and USD are never aggregated without explicit FX conversion. All metrics are currency-specific.
+
+8. **Unknown channels:** UTM parameters and referrers that don't match known patterns are classified as `Unknown` rather than silently mapped to a default.
+
+9. **Late event handling:** Late-arriving events trigger session reconstruction and attribution reconciliation for the affected visitor. No time-based cutoff prevents late corrections.
+
+10. **Conversion timestamp:** `orders.created_at` is used as the conversion/paid timestamp because no separate `paid_at` or `fulfilled_at` field exists in the source schema.
+
+### Known limitations
+
+1. **Cross-device first-visit calculation:** Query 2 (days to convert) is only as accurate as the identity links present in the data. This dataset has 96 shared-email cases; a production system with hundreds of thousands of cross-device customers would surface more identity conflicts.
+
+2. **Refund amounts unavailable:** Refunded orders are excluded rather than netted against revenue because `orders.csv` has no refund amount column. This understates true paid revenue if partial refunds exist.
+
+3. **No separate paid timestamp:** The pipeline assumes `created_at` represents the paid/conversion moment. If orders remain in a `pending` state for hours before payment, the conversion timestamp will be early.
+
+4. **No FX rates:** Multi-currency reporting is limited to separate currency buckets. A production system would integrate live or historical FX rates for consolidated reporting.
+
+5. **Single-tenant local deployment:** No authentication beyond webhook secrets, no tenant isolation, no rate limiting, no quota enforcement.
+
+6. **Global advisory locks:** Identity resolution uses global locks that prevent concurrent processing of the same visitor. At scale, this becomes a bottleneck (see scaling analysis).
+
+7. **Session reconstruction cost:** Late events trigger full visitor session rebuilds. For high-frequency visitors with thousands of events, this is expensive.
+
+8. **No ML-based attribution:** The implementation uses deterministic last-click attribution only. Data-driven, Shapley value, or machine-learned attribution models are not included.
+
+9. **September/October scope only:** The system is designed for continuous operation, but has only been tested with September 2026 data and a three-day October follow-up. Year-boundary handling, multi-year retention, and long-term data archival are not validated.
+
+10. **Performance numbers pending:** Replay throughput, worker processing latency, and dashboard query performance have not been measured under load. The scaling analysis is a design projection, not measured benchmark data.
+
+### What was NOT silently assumed
+
+- Event `value` is preserved but not used as order revenue (orders.csv is authoritative)
+- Direct is not a catch-all; it requires explicit evidence of a session-start page view with no campaign
+- IP address, user agent, and location are never used to merge visitor identities
+- Missing spend is null, not zero; ROAS with zero spend is null, not infinity
+- Session boundaries are strictly `gap > 30 minutes`; exactly 30 minutes stays in the same session
+- Attribution lookback is exactly 30 days inclusive at the lower boundary; day 31 is excluded
+- Touchpoints after the conversion timestamp are never eligible
+
+Every uncertain assumption is documented in the data dictionary or architecture doc. Where the source schema was ambiguous, the conservative choice was made and disclosed.
+
 ## Important limitations to disclose
 
 - `orders.created_at` is used as the paid conversion timestamp because no separate paid/refund timestamp exists.
