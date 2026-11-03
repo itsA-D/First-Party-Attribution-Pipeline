@@ -1,0 +1,13 @@
+.git
+.env
+data
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.venv
+replay_failures.json
+docs/data-profile.json
+.playwright-mcp
+*.zip

@@ -1,0 +1,98 @@
+name: urban-thread
+
+x-app-environment: &app-environment
+  APP_ENV: ${APP_ENV:-local}
+  DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/urban_thread
+  ORDER_WEBHOOK_SECRET: ${ORDER_WEBHOOK_SECRET:-}
+  REPORTING_TIMEZONE: ${REPORTING_TIMEZONE:-UTC}
+  ATTRIBUTION_MODEL: ${ATTRIBUTION_MODEL:-last_click}
+  ATTRIBUTION_LOOKBACK_DAYS: ${ATTRIBUTION_LOOKBACK_DAYS:-30}
+  SESSION_TIMEOUT_MINUTES: ${SESSION_TIMEOUT_MINUTES:-30}
+  HISTORICAL_VALIDITY_DAYS: ${HISTORICAL_VALIDITY_DAYS:-365}
+  IDENTITY_BACKFILL_DAYS: ${IDENTITY_BACKFILL_DAYS:-30}
+  MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-1}
+  WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-5}
+  WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-120}
+  WORKER_MAX_ATTEMPTS: ${WORKER_MAX_ATTEMPTS:-5}
+  REPLAY_CONCURRENCY: ${REPLAY_CONCURRENCY:-15}
+  REPLAY_MAX_RETRIES: ${REPLAY_MAX_RETRIES:-5}
+  REPLAY_TIMEOUT_SECONDS: ${REPLAY_TIMEOUT_SECONDS:-30}
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: urban_thread
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
+      - ./queries.sql:/queries.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d urban_thread"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    build: .
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/urban_thread
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: python -m app.worker
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    command: streamlit run dashboard/app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
+    environment:
+      API_BASE_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+
+  replay:
+    build: .
+    profiles: ["tools"]
+    command: sh -c "python -m scripts.replay --data-dir /app/data --base-url http://api:8000 --concurrency $${REPLAY_CONCURRENCY:-15}"
+    environment: *app-environment
+    depends_on:
+      api:
+        condition: service_started
+      worker:
+        condition: service_started
+    volumes:
+      - ./data:/app/data:ro
+
+volumes:
+  postgres_data:
