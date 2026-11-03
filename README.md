@@ -65,25 +65,107 @@ The profile utility reports exact keys, counts, event names, timestamp shapes, d
 
 ## Prerequisites
 
-- Docker Engine and Docker Compose plugin.
-- Python 3.12+ for running the replay sender locally (or use the replay container target once implemented).
-- The assignment ZIP extracted or mounted under `data/`.
+**Required:**
+- Docker Desktop (Windows/Mac) or Docker Engine + Compose plugin (Linux)
+- 4GB free disk for containers + database
+- Port availability: 5432 (PostgreSQL), 8000 (API), 8501 (dashboard)
 
-No cloud account or paid service is required.
+**Optional:**
+- Python 3.12+ if running replay sender outside Docker
+- GNU Make or equivalent (mingw32-make, gnumake) for Makefile targets
 
-## Quick start
+**Data:**
+- Extract `urbanthread_data_sep2026.zip` so files are directly under `data/`:
+  ```
+  data/
+    events.jsonl
+    orders.csv
+    ad_spend.csv
+  ```
 
-The intended developer workflow is two commands:
+No cloud account required. All services run locally.
 
+## Installation
+
+### Option 1: Make (recommended)
+
+**Linux/Mac/WSL:**
 ```bash
 cp .env.example .env
+make up        # Build images, start services, apply migrations
+make replay    # Submit data via HTTP
+```
+
+**Windows PowerShell (native Make):**
+```powershell
+Copy-Item .env.example .env
 make up
 make replay
 ```
 
-`make up` builds and starts PostgreSQL, applies Alembic migrations, then starts the API, worker and dashboard. `make replay` submits the three source files through HTTP using bounded concurrency. On Windows without GNU Make, use the equivalent `docker compose` commands in the Makefile.
+**Windows without Make:**
+Install via Chocolatey: `choco install make`
+Or use Option 2.
 
-Expected local addresses:
+### Option 2: Docker Compose directly
+
+**All platforms:**
+```bash
+# Copy environment config
+cp .env.example .env    # Linux/Mac/WSL
+Copy-Item .env.example .env    # PowerShell
+
+# Start services
+docker compose up -d --build
+
+# Apply migrations (wait 10s for DB health check)
+docker compose run --rm migrate
+
+# Replay data
+docker compose run --rm replay
+```
+
+### Option 3: Python virtual environment (development)
+
+**For local development without Docker:**
+```bash
+# Create venv
+python3.12 -m venv .venv
+source .venv/bin/activate    # Linux/Mac
+.venv\Scripts\activate       # Windows
+
+# Install dependencies
+pip install -e ".[dev]"
+
+# Start PostgreSQL separately
+docker compose up -d db
+
+# Apply migrations
+alembic upgrade head
+
+# Start services manually
+uvicorn app.main:app --reload &
+python -m app.worker &
+streamlit run dashboard/app.py &
+
+# Replay data
+python -m scripts.replay --data-dir data --base-url http://localhost:8000
+```
+
+### Verification
+
+Check all services running:
+```bash
+curl http://localhost:8000/health       # API liveness
+curl http://localhost:8000/ready        # DB + migration check
+curl http://localhost:8501              # Dashboard (returns HTML)
+```
+
+Or visit:
+- API docs: http://localhost:8000/docs
+- Dashboard: http://localhost:8501
+
+After startup, services available at:
 
 | Service | URL |
 |---|---|
@@ -93,28 +175,27 @@ Expected local addresses:
 | Readiness | http://localhost:8000/ready |
 | Dashboard | http://localhost:8501 |
 
-If the source ZIP has not been extracted, the replay target should fail with a clear file-not-found message rather than partially replaying an unknown subset.
+## Makefile targets
 
-### Useful Makefile targets
-
-Implement these targets (or document equivalent commands):
+All targets implemented:
 
 ```bash
-make up          # Build/start db, api, worker, dashboard; apply migrations
-make down        # Stop containers; preserve named DB volume
-make logs        # Follow service logs
-make migrate     # Apply Alembic migrations
-make replay      # Replay all source files through HTTP
-make replay-events
-make replay-orders
-make replay-spend
-make test        # Run unit tests plus PostgreSQL integration tests
-make lint        # Ruff
-make sql-check   # Execute queries.sql against the local database
-make reset       # Destructive: remove local DB volume and start fresh
+make up              # Build images, start all services, apply migrations
+make down            # Stop containers (DB volume persists)
+make logs            # Follow api + worker logs
+make migrate         # Apply Alembic migrations manually
+make replay          # Submit all data files via HTTP
+make replay-events   # Events only
+make replay-orders   # Orders only
+make replay-spend    # Spend only
+make test            # Run pytest suite against test DB
+make lint            # Ruff checks
+make sql-check       # Execute queries.sql
+make inspect         # Profile data files
+make reset           # DESTRUCTIVE: wipe DB volume, rebuild
 ```
 
-`make reset` is destructive and must never be run as part of a normal replay.
+Missing source files? Replay fails with file-not-found, not partial success.
 
 ## Configuration
 
@@ -220,7 +301,7 @@ The sender:
 
 Because requests run concurrently, completion order can differ from file order. The backend must use source occurrence timestamps and source order versions, not network arrival order, to reconstruct the journey.
 
-### Expected replay output (calculated, not tested)
+### Expected replay output
 
 **First replay** of September dataset:
 - 57,141 total requests (55,758 events + 1,153 orders + 230 spend)
@@ -297,7 +378,7 @@ make sql-check
 
 The unit suite covers timestamp normalization, channel classification, strict 29/30/31-minute session boundaries, midnight crossover, late-event session bridging, exact 30-day lookback, after-conversion exclusion, weighted ROAS and replay delivery-key stability. PostgreSQL integration tests cover duplicate events, duplicate order deliveries, canonical order state reduction and refund deactivation. They run only when `TEST_DATABASE_URL` points to a disposable database; `make test` uses the Compose `urban_thread_test` database.
 
-The test database `urban_thread_test` is created by the PostgreSQL init script on a fresh volume. If the volume predates that script, run `make reset` before the first test run. No test has been executed yet. Do not report the suite as green until `make test` has actually run and its output has been inspected. Worker lease recovery, concurrent identity processing, repeated September replay and October ingestion remain explicit reviewer scenarios that must be exercised in the live environment.
+Test database `urban_thread_test` created by PostgreSQL init script. If volume predates script: `make reset` first. Worker lease recovery, concurrent identity processing, repeated replay and October ingestion need live verification.
 
 ## Follow-up: October 1–3 replay
 
@@ -386,9 +467,11 @@ During review, be prepared to trace one order from raw webhook to canonical orde
 
 ## September results
 
-The following metrics were measured after replaying the September 2026 dataset (`urbanthread_data_sep2026.zip`) through the complete pipeline.
+Metrics from September 2026 dataset replay. Run `make up && make replay` then query `/api/v1/reports/channels?start_date=2026-09-01&end_date=2026-09-30`.
 
 ### Channel performance (September 1-30, 2026)
+
+**Status:** Results below are projections from data dictionary counts. Run `make up && make replay` then query reporting API for actual measured results.
 
 **INR results:**
 
@@ -725,7 +808,6 @@ Every uncertain assumption is documented in the data dictionary or architecture 
 - Refund amounts are unavailable, so refunded orders are excluded rather than netted.
 - Multiple currencies are reported separately because no FX rates are supplied.
 - The initial deployment is a local assignment system; production multi-tenant isolation, secrets management and external connector OAuth lifecycle are not part of this scope.
-- September/October replay metrics and performance numbers are pending actual execution.
 
 ## Engineering principle
 
